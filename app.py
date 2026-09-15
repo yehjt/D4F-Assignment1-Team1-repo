@@ -4,24 +4,45 @@ import plotly.express as px
 from datetime import datetime
 from pathlib import Path
 
+st.set_page_config(page_title="SG Job Postings Dashboard", layout="wide")
+
 print(f"🟢 Rerun at: {datetime.now()}")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data" / "job_data.csv"
+COMPANIES_PATH = BASE_DIR / "data" / "companies.csv"
+LOOKUPS_PATH = BASE_DIR / "data" / "lookups.csv"
 
 
 @st.cache_data
-def load_data(path):
-    df = pd.read_csv(path)
+def load_data(data_path, companies_path, lookups_path):
+    df = pd.read_csv(data_path)
     df["posting_date"] = pd.to_datetime(df["posting_date"])
+
+    # company_id, category_id, employment_type_id, position_level_id and job_status_id
+    # were normalized out into small lookup tables to keep job_data.csv small.
+    # Join everything back in so the rest of the app can work with plain names.
+    companies = pd.read_csv(companies_path)
+    df = df.merge(companies, on="company_id", how="left").drop(columns=["company_id"])
+    df = df.rename(columns={"company_name": "company"})
+
+    lookups = pd.read_csv(lookups_path)
+    for dim in ["category", "employment_type", "position_level", "job_status"]:
+        dim_lookup = lookups[lookups["dim"] == dim][["id", "value"]].rename(
+            columns={"id": f"{dim}_id", "value": dim}
+        )
+        df = df.merge(dim_lookup, on=f"{dim}_id", how="left").drop(columns=[f"{dim}_id"])
+
     return df
 
 
-df = load_data(DATA_PATH)
+df = load_data(DATA_PATH, COMPANIES_PATH, LOOKUPS_PATH)
 
-st.set_page_config(page_title="SG Job Postings Dashboard", layout="wide")
 st.title("💼 Singapore Job Postings Dashboard")
-st.caption("Explore job postings scraped from MyCareersFuture (SGJobData).")
+st.caption(
+    "Explore job postings scraped from MyCareersFuture (SGJobData), "
+    "with a focus on which roles are hardest to fill."
+)
 
 st.sidebar.header("Filters")
 
@@ -55,6 +76,19 @@ salary_range = st.sidebar.slider(
 )
 date_range = st.sidebar.date_input("Posting Date Range", value=(date_min, date_max))
 
+st.sidebar.header("Hard-to-Fill Threshold")
+st.sidebar.caption(
+    "A posting is flagged 'hard to fill' if it was reposted, or received "
+    "very few applications relative to its vacancies."
+)
+max_apps_per_vacancy = st.sidebar.slider(
+    "Flag postings with applications-per-vacancy below",
+    min_value=0.0,
+    max_value=10.0,
+    value=1.0,
+    step=0.5,
+)
+
 # Make a copy of the original dataframe to apply filters
 filtered_df = df.copy()
 
@@ -81,6 +115,13 @@ if len(date_range) == 2:
     filtered_df = filtered_df[filtered_df["posting_date"].between(
         pd.to_datetime(start_date), pd.to_datetime(end_date))]
 
+# A posting is "hard to fill" if it was reposted at least once, OR it drew very
+# few applications relative to how many vacancies it needs to fill.
+filtered_df["hard_to_fill"] = (
+    (filtered_df["repost_count"] > 0)
+    | (filtered_df["applications_per_vacancy"] < max_apps_per_vacancy)
+)
+
 
 st.header("Filtered Results")
 st.write(
@@ -90,62 +131,95 @@ st.dataframe(filtered_df, use_container_width=True)
 
 # KPI Rows
 st.header("Key Metrics")
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 col1.metric("Job Postings", f"{len(filtered_df):,}")
 col2.metric("Average Salary", f"${filtered_df['average_salary'].mean():,.0f}")
-col3.metric("Median Salary", f"${filtered_df['average_salary'].median():,.0f}")
-col4.metric("Total Vacancies", f"{filtered_df['num_vacancies'].sum():,.0f}")
+hard_to_fill_rate = filtered_df["hard_to_fill"].mean() * 100 if len(filtered_df) else 0
+col3.metric("Hard-to-Fill Rate", f"{hard_to_fill_rate:.1f}%")
+col4.metric("Avg Applications / Vacancy", f"{filtered_df['applications_per_vacancy'].mean():.1f}")
+col5.metric("Avg Posting Duration", f"{filtered_df['posting_duration_days'].mean():.0f} days")
 
-st.header("Visual Analysis")
+st.header("Hard-to-Fill Vacancy Analysis")
 
 col_left, col_right = st.columns(2)
 
-# Tells Streamlit to put the following content in the left column
 with col_left:
-    st.subheader("Average Salary by Category")
-    avg_salary_by_category = (
-        filtered_df.groupby("category", as_index=False)["average_salary"]
+    st.subheader("Hard-to-Fill Rate by Category")
+    hard_by_category = (
+        filtered_df.groupby("category", as_index=False)["hard_to_fill"]
         .mean()
-        .sort_values("average_salary", ascending=False)
-        .head(10)  # Top 10 categories only for clarity
+        .assign(hard_to_fill=lambda d: d["hard_to_fill"] * 100)
+        .sort_values("hard_to_fill", ascending=False)
+        .head(10)
     )
-    fig_category = px.bar(avg_salary_by_category, x="category", y="average_salary")
-    st.plotly_chart(fig_category, use_container_width=True)
+    fig_hard_category = px.bar(
+        hard_by_category, x="category", y="hard_to_fill",
+        labels={"hard_to_fill": "Hard-to-fill rate (%)"},
+    )
+    st.plotly_chart(fig_hard_category, use_container_width=True)
 
-# Tells Streamlit to put the following content in the right column
 with col_right:
-    st.subheader("Postings by Employment Type")
-    tx_by_employment = (
-        filtered_df.groupby("employment_type", as_index=False)
-        .size()
-        .rename(columns={"size": "postings"})
-        .sort_values("postings", ascending=False)
+    st.subheader("Hard-to-Fill Rate by Position Level")
+    hard_by_level = (
+        filtered_df.groupby("position_level", as_index=False)["hard_to_fill"]
+        .mean()
+        .assign(hard_to_fill=lambda d: d["hard_to_fill"] * 100)
+        .sort_values("hard_to_fill", ascending=False)
     )
-    fig_employment = px.bar(tx_by_employment, x="employment_type", y="postings")
-    st.plotly_chart(fig_employment, use_container_width=True)
+    fig_hard_level = px.bar(
+        hard_by_level, x="position_level", y="hard_to_fill",
+        labels={"hard_to_fill": "Hard-to-fill rate (%)"},
+    )
+    st.plotly_chart(fig_hard_level, use_container_width=True)
 
+st.subheader("Applications per Vacancy vs. Average Salary")
+st.caption(
+    "Roles in the bottom-left (low applications, but not necessarily low salary) "
+    "are the ones employers struggle most to fill despite paying competitively."
+)
+scatter_df = (
+    filtered_df.groupby("category", as_index=False)
+    .agg(
+        avg_salary=("average_salary", "mean"),
+        avg_apps_per_vacancy=("applications_per_vacancy", "mean"),
+        postings=("average_salary", "count"),
+    )
+)
+fig_scatter = px.scatter(
+    scatter_df, x="avg_salary", y="avg_apps_per_vacancy", size="postings",
+    hover_name="category",
+    labels={"avg_salary": "Average Salary ($)", "avg_apps_per_vacancy": "Avg Applications / Vacancy"},
+)
+st.plotly_chart(fig_scatter, use_container_width=True)
 
-st.subheader("Monthly Median Salary & Postings Volume")
+st.subheader("Monthly Hard-to-Fill Rate & Median Applications per Vacancy")
 trend = (
     filtered_df.assign(month=filtered_df["posting_date"].dt.to_period("M").dt.to_timestamp())
     .groupby("month", as_index=False)
-    .agg(median_salary=("average_salary", "median"), postings=("title", "count"))
+    .agg(
+        hard_to_fill_rate=("hard_to_fill", "mean"),
+        median_apps_per_vacancy=("applications_per_vacancy", "median"),
+    )
     .sort_values("month")
 )
-fig_trend = px.line(trend, x="month", y="median_salary", markers=True)
+trend["hard_to_fill_rate"] = trend["hard_to_fill_rate"] * 100
+fig_trend = px.line(
+    trend, x="month", y=["hard_to_fill_rate", "median_apps_per_vacancy"], markers=True,
+)
 st.plotly_chart(fig_trend, use_container_width=True)
 
-st.subheader("Top 10 Hiring Companies")
-top_companies = (
-    filtered_df.groupby("company", as_index=False)
+st.subheader("Top 10 Companies with the Most Hard-to-Fill Postings")
+top_companies_hard = (
+    filtered_df[filtered_df["hard_to_fill"]]
+    .groupby("company", as_index=False)
     .size()
-    .rename(columns={"size": "postings"})
-    .sort_values("postings", ascending=False)
+    .rename(columns={"size": "hard_to_fill_postings"})
+    .sort_values("hard_to_fill_postings", ascending=False)
     .head(10)
 )
-fig_companies = px.bar(top_companies, x="company", y="postings")
-st.plotly_chart(fig_companies, use_container_width=True)
+fig_companies_hard = px.bar(top_companies_hard, x="company", y="hard_to_fill_postings")
+st.plotly_chart(fig_companies_hard, use_container_width=True)
 
 with st.expander("View Filtered Job Postings"):
     st.dataframe(filtered_df, use_container_width=True, height=350)
